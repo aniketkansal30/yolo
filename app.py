@@ -16,13 +16,21 @@ logger = logging.getLogger(__name__)
 # Loaded in a background thread so the web server can bind to $PORT
 # immediately (Render's health check needs a fast response, otherwise it
 # kills the instance before the model finishes loading).
+#
+# IMPORTANT: this must be resilient to gunicorn worker restarts. If the
+# worker process that's loading the model gets killed/recycled before the
+# thread finishes, a fresh module import happens and model_loaded can look
+# stuck at False forever. ensure_model_loading() below is also called
+# defensively from analyze_image(), so a stuck/failed load self-heals on
+# the next request instead of staying broken forever.
 model = None
 model_load_error = None
+model_loading = False
 model_lock = threading.Lock()
 
 
 def load_model():
-    global model, model_load_error
+    global model, model_load_error, model_loading
     try:
         from ultralytics import YOLO
         # yolov8n = "nano" = ~6MB, ~lowest RAM footprint of the YOLOv8 family.
@@ -31,17 +39,41 @@ def load_model():
         # For a car-damage-specific model, swap this path with:
         #   YOLO("path/to/your/best.pt")
         m = YOLO("yolov8n.pt")  # auto-downloads on first run (~6MB)
+        # Warm up with a tiny dummy inference so the very first real
+        # request isn't the one that pays the JIT/graph-build cost.
+        try:
+            import numpy as np
+            m(np.zeros((64, 64, 3), dtype="uint8"), verbose=False)
+        except Exception as warmup_err:
+            logger.warning(f"Warmup inference skipped: {warmup_err}")
         with model_lock:
             model = m
+            model_load_error = None
         logger.info("✅ YOLO model loaded successfully (yolov8n)")
     except Exception as e:
-        model_load_error = str(e)
+        with model_lock:
+            model_load_error = str(e)
         logger.error(f"❌ Model load failed: {e}")
+    finally:
+        with model_lock:
+            model_loading = False
+
+
+def ensure_model_loading():
+    """Kick off a load attempt if nothing is loaded and nothing is in flight.
+    Safe to call from any request handler — cheap no-op if already loaded
+    or already loading."""
+    global model_loading
+    with model_lock:
+        if model is not None or model_loading:
+            return
+        model_loading = True
+    threading.Thread(target=load_model, daemon=True).start()
 
 
 # Kick off model loading in the background immediately on import,
 # so gunicorn can bind to the port right away.
-threading.Thread(target=load_model, daemon=True).start()
+ensure_model_loading()
 
 # Car/vehicle related COCO class IDs
 VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
@@ -94,8 +126,12 @@ def analyze_image(image_base64: str):
         current_model = model
 
     if current_model is None:
+        # Self-heal: kick off another load attempt in case the previous
+        # one died silently (e.g. worker recycled mid-load). This won't
+        # help THIS request, but the next request will likely succeed.
+        ensure_model_loading()
         if model_load_error:
-            return {"error": f"Model failed to load: {model_load_error}"}, 503
+            return {"error": f"Model failed to load: {model_load_error}. Retrying in background — try again shortly."}, 503
         return {"error": "Model is still loading, please retry in a few seconds"}, 503
 
     results = current_model(img, verbose=False)[0]
@@ -133,12 +169,14 @@ def analyze_image(image_base64: str):
 
 @app.route("/", methods=["GET"])
 def home():
+    with model_lock:
+        loaded = model is not None
     return jsonify({
         "status": "ok",
         "service": "YOLO Vehicle Damage Detection API",
         "model": "YOLOv8n (COCO pretrained)",
-        "model_loaded": model is not None,
-        "version": "2.1.0"
+        "model_loaded": loaded,
+        "version": "2.1.1"
     })
 
 
@@ -146,10 +184,18 @@ def home():
 def health():
     # Always return 200 fast so Render's health check / port-bind check
     # passes even while the model is still loading in the background.
+    # Also self-heals: if nothing is loaded and nothing is loading
+    # (e.g. the original load thread died silently), kick off a retry.
+    ensure_model_loading()
+    with model_lock:
+        loaded = model is not None
+        loading = model_loading
+        err = model_load_error
     return jsonify({
         "status": "healthy",
-        "model_loaded": model is not None,
-        "model_load_error": model_load_error
+        "model_loaded": loaded,
+        "model_loading": loading,
+        "model_load_error": err
     })
 
 
