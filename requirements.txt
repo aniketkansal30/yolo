@@ -1,0 +1,8 @@
+flask
+flask-cors
+gunicorn
+ultralytics
+Pillow
+torch
+torchvision
+numpy
